@@ -1,0 +1,30 @@
+# CALLISTO Trainer application settings.
+#
+# Only app-level concerns live here: where files go, and how hard the app works
+# to stay responsive. Training configuration is NOT set here -- each dataset
+# snapshot generates its own config.yaml beside the data it describes, which the
+# Train tab edits and runs.
+
+paths:
+  # All relative paths below resolve against project_root.
+  project_root: .
+  database: data/annotations.db
+  display_cache: data/display_cache
+  datasets: datasets
+  outputs: outputs
+  # Optional: a YAML overriding the vendored preprocessing defaults. Leave unset
+  # to use the settings the Burst Identifier checkpoints were trained with
+  # (plotutil_median_db background, db_window -1..8 dB, 224x224). Change this
+  # only if you intend every exported tensor to differ from that pipeline.
+  # pipeline_config: configs/pipeline_override.yaml
+
+performance:
+  # Decode threads. Reading a gzipped FITS is the dominant cost in the labelling
+  # loop; 3 keeps the queue warm without competing with the UI thread.
+  decode_workers: 3
+  # Files decoded ahead of the cursor so Next is instant.
+  prefetch_ahead: 4
+  # Resident decoded spectra. Individual files range from ~1 MB to ~28 MB.
+  memory_cache_mb: 512
+  # Normalized arrays cached on disk so a second pass skips the gzip entirely.
+  disk_cache_gb: 8

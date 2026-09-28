@@ -1,0 +1,25 @@
+# CALLISTO Trainer dependencies.
+#
+# Torch is installed separately from the CUDA-matched index so the RTX 5060 is
+# used for training. On this machine (verified working in the Burst Identifier
+# project) that is cu132:
+#
+#   pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu132
+#
+# GUI
+PySide6==6.10.0
+pyqtgraph==0.14.0
+
+# Science / pipeline (versions match H:\Burst Identifier so vendored
+# preprocessing produces byte-identical tensors)
+astropy==7.2.0
+numpy==2.4.4
+scipy==1.17.1
+scikit-learn==1.9.0
+matplotlib==3.10.9
+pandas==3.0.3
+PyYAML==6.0.3
+tqdm==4.67.3
+
+torch==2.12.0
+torchvision==0.27.0
