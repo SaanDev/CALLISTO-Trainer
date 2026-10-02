@@ -236,7 +236,8 @@ class PredictTab(QWidget):
         self.burst_threshold.setDecimals(3)
         self.burst_threshold.setValue(0.5)
         self.burst_threshold.setToolTip(
-            "A region is a burst when 1 - P(No_Burst) - P(RFI) reaches this value.\n"
+            "A region is a burst when its burst evidence (1 - P(not a burst)) reaches "
+            "this value.\n"
             "Training tunes it on the validation files to a false-alarm budget; "
             "raise it for fewer false alarms, lower it to catch fainter bursts."
         )
@@ -252,9 +253,13 @@ class PredictTab(QWidget):
             "chooses it on the validation data. It never changes whether a region is a "
             "burst, only which type."
         )
-        self.show_rfi = QCheckBox("Show regions called RFI")
+        self.show_rfi = QCheckBox("Show RFI")
         self.show_rfi.setChecked(True)
-        self.show_rfi.setToolTip("Draw the regions the model rejected as interference.")
+        self.show_rfi.setToolTip(
+            "Draw the interference found in each file. RFI is detected separately and "
+            "never decides the verdict: a file with a burst is Burst even with RFI in it, "
+            "a file with only RFI is No_Burst."
+        )
         decision.addWidget(QLabel("Burst threshold (unified):"))
         decision.addWidget(self.burst_threshold)
         decision.addWidget(QLabel("Type frequency correction:"))
@@ -701,7 +706,7 @@ class PredictTab(QWidget):
                 errors += 1
             if result.is_burst:
                 bursts += 1
-            rfi += len(result.rfi_regions)
+            rfi += len(result.rfi_sources)
             for region in result.regions:
                 if region.burst_type:
                     type_counts[region.burst_type] = type_counts.get(region.burst_type, 0) + 1
@@ -734,7 +739,7 @@ class PredictTab(QWidget):
                 "regions: " + "  ".join(f"{k} {v:,}" for k, v in sorted(type_counts.items()))
             )
         if rfi:
-            parts.append(f"{rfi:,} region(s) rejected as RFI")
+            parts.append(f"{rfi:,} interference source(s) found")
         if errors:
             parts.append(f"{errors:,} unreadable")
         self.summary.setText("   ·   ".join(parts))
@@ -800,8 +805,8 @@ class PredictTab(QWidget):
                 confirmed=False,  # dashed: these are candidates, not labels
             )
         if self.show_rfi.isChecked():
-            # Rejected as interference: drawn in the RFI colour so it is clear
-            # what the model looked at and why the file is (or is not) a burst.
+            # Interference, found separately from the bursts: drawn in the RFI
+            # colour beside them, whatever the file's verdict.
             for offset, region in enumerate(result.rfi_regions):
                 self.canvas.add_box(
                     len(result.regions) + offset,
@@ -816,11 +821,14 @@ class PredictTab(QWidget):
         self.preview_title.setText(f"<b>{result.file_name}</b> — {headline}")
 
         rfi_lines = []
-        for region in result.rfi_regions:
-            why = "; ".join(region.interference_hints)
+        for source in result.rfi_sources:
+            span = ""
+            if source.freq_lo_mhz is not None:
+                span = f" · {source.freq_lo_mhz:.1f}-{source.freq_hi_mhz:.1f} MHz"
+            segments = f" · {source.segments} segments" if source.segments > 1 else ""
             rfi_lines.append(
-                f'<span style="color:{color_for_type("RFI")}">■</span> RFI · '
-                f"{region.area:,} px" + (f" · {why}" if why else "")
+                f'<span style="color:{color_for_type("RFI")}">■</span> RFI ({source.kind})'
+                f"{span}{segments}"
             )
         if not result.regions:
             self.region_detail.setText(

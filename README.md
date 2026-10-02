@@ -218,14 +218,30 @@ re-exported with the same values.
 
 ## The unified model (default)
 
-One softmax -- **No_Burst / RFI / Type II / Type III / Type IIIG / Type IV /
-Other** -- applied to a *region*. It answers everything at once: whether a region is a
-burst, which type it is, and, applied across a file's candidate regions, where
-the bursts are. A region is a burst when its **burst evidence**,
-`1 − P(No_Burst) − P(RFI)`, reaches the model's **calibrated threshold**; a file
-is a burst if any region is. Regions the model assigns to RFI are shown as RFI,
-never as detections. Which *type* a burst is called is corrected for how often
-each type really occurs (see *Type frequencies* below).
+One softmax applied to a *region*. It answers everything at once: whether a
+region is a burst, which type it is (Type II / III / IIIG / IV / Other), and,
+applied across a file's candidate regions, where the bursts are. A region is a
+burst when its **burst evidence** -- one minus the probability that it is not a
+burst -- reaches the model's **calibrated threshold**; a file is a burst if any
+region is. Which *type* a burst is called is corrected for how often each type
+really occurs (see *Type frequencies* below).
+
+**RFI and No_Burst are one outcome in everything you see** -- predictions,
+evaluation reports, confusion matrices, class counts: *not a burst*. Inside,
+the model is still trained with RFI as its own rejection class, because that
+split cut false alarms from 6 to 1 of 207 held-out quiet files (see *Measured,
+per file*). **RFI is detected separately**, among the regions that are not
+bursts: a region is reported as RFI when its measured features carry an
+interference signature (the table below) or the model's own RFI output outweighs
+its background output. Regions on the same channels are grouped into one
+**interference source** -- the periodic calibration block in a station's lowest
+channels comes out of the region finder as about 14 segments in every file, and
+is reported once. RFI never decides a verdict:
+
+- a file with a burst is **Burst**, whatever interference it also holds, and
+  lists that interference beside the bursts (`Type III  ·  RFI x1`);
+- a file with only interference is **No_Burst**, and lists it (`RFI x2`);
+- a burst region is never turned into RFI, whatever it overlaps.
 
 ### Interference is found, not drawn
 
@@ -244,7 +260,9 @@ region features and names it **RFI** when it has an interference signature
 | carrier | its channels stay bright outside the region > 40% of the time, or a ≤ 22-channel line lasting > 40% of the file |
 | flagged channels | the station's own `RFI_FREQ` table covers the region |
 
-The thresholds were set on 22,693 regions from 555 archived files. They name
+The exporter uses the same rules to name the RFI the model trains on; the
+Predict tab uses them to report it. The thresholds were set on 22,693 regions
+from 555 archived files. They name
 **0% of the regions on real Type III boxes, 0.9% on Type II and 0.3% on Other**,
 against 85-100% of each synthetic interference pattern and about a quarter of
 all background regions. Looked at by eye, the background regions they name are
@@ -342,6 +360,112 @@ direction, not a precise size. The interference features
 | noisy station | `log_snr`, `fill_fraction`, `file_bright_fraction`, `file_noise` |
 | flagged channels | `rfi_flag_fraction` -- the station's own `RFI_FREQ` table, previously unused |
 | Type IIIG | `burst_count` |
+
+### Station and date: a capped correction
+
+The model also takes the file's **station** and **observation month and year**.
+Both carry real signal -- each station has its own receiver and its own
+interference, and solar activity and the ionosphere change with the season and
+the cycle -- but in labelled data they are also a shortcut. How often a
+station's files hold a burst mostly reflects which of its files were picked for
+labelling (USA-BOSTON: 4 bursts in 287 labelled files; ALASKA-COHOE: 295 in
+671), and a held-out split drawn from the same labels cannot tell the two apart.
+So station and date are not fused freely with the image; they enter as a
+**bounded correction** on top of what the image and region features say
+(`models/physics_model.py`, `StationDateCorrection`):
+
+* **Capped.** Each class score moves by at most `cap / 2` through a `tanh`, so
+  no log-odds -- burst vs not a burst, or one type vs another -- moves by more
+  than `cap`. At the default `cap = 1`, a region the image puts at 50% can end
+  up between 27% and 73%; one at 95% no lower than 87%.
+* **Interactions, not just priors.** The correction also reads the image
+  representation, so it can learn "this narrowband line, at this station, is its
+  known carrier" -- within the same cap.
+* **The image path stands alone.** The correction starts at zero, and during
+  training station and date are hidden at random -- together (25% of samples),
+  so the image path is trained on its own, and separately (15% each), so either
+  can be missing later. With both unknown the correction is exactly zero.
+* **Encoding** (`metadata_features.StationDateEncoder`): the station's index if
+  it has at least 10 training files (others, and stations never seen, share an
+  "unknown" slot); the month as a point on the yearly cycle; the year as a
+  number clamped to the trained span, so a file from after the last trained
+  month is treated like that month rather than extrapolated to. The station list
+  and span are fitted on the training split when training starts and saved in
+  the checkpoint.
+
+The Train tab's **Station + date** setting chooses the cap (off, 0.5, 1 or 2).
+Every file-level report (`val_file_metrics.json`, `test_file_metrics.json`) then
+has a `station_date_effect` section: each file is judged twice, as scored and
+with station and date hidden, and every file whose verdict differs is listed --
+false alarms added or removed, bursts found or lost because of them.
+
+### Backbones
+
+`resnet18` (default), `resnet34`, `resnet50` and `convnext_tiny` (plus the older
+`efficientnet_b0` and `mobilenet_v3_small`), all ImageNet-pretrained. On an 8 GB
+GPU, ResNet50 needs a batch of at most 32 regions and ConvNeXt-Tiny at most 24;
+the Train tab lowers it when you pick one. Above that, Windows does not fail with
+out-of-memory -- it spills into system memory and training runs several times
+slower (ConvNeXt-Tiny at 32 crept over after nine epochs and went from 3 to 13
+minutes an epoch). The same happens if another program -- or this app's own
+Predict or Label tab holding a model -- is using GPU memory while a large
+backbone trains; the sign is the GPU at 100% while drawing about half its power.
+
+`performance.channels_last` is now **off** by default. Measured on an RTX 5060
+(torch 2.12, CUDA 13), it made ResNet training 5-8x slower (ResNet18 243 vs
+1,402 images/s, ResNet50 58 vs 473) and ConvNeXt no faster.
+
+### What station/date and the deeper backbones are worth (measured)
+
+One snapshot of all 3,512 labelled files (25,054 regions), every model trained 20
+epochs and calibrated to the 5% budget on the validation files, then judged on
+the **test files** -- 335 quiet, 189 with bursts -- exactly as Predict runs.
+"Found at 2% / 5% FA" counts burst files found at the threshold where 2% / 5% of
+the quiet test files are flagged, the same rule for every model, so it compares
+ranking without depending on where calibration happened to land. Each station/date
+model is also scored with station and date hidden.
+
+| model | false alarms (of 335) | bursts found (of 189) | found at 2% FA | found at 5% FA | train |
+|---|---|---|---|---|---|
+| ResNet18, no station/date, seed 42 | 19 | 141 | 115 | 137 | 18 min |
+| ResNet18, no station/date, seed 7 | 20 | 145 | 114 | 144 | 18 min |
+| ResNet18 + station/date, seed 42 | 19 | 142 | 117 | 137 | 18 min |
+| &nbsp;&nbsp;same model, station/date hidden | 24 | 141 | 115 | 138 | |
+| ResNet18 + station/date, seed 7 | 15 | 142 | 130 | 143 | 18 min |
+| &nbsp;&nbsp;same model, station/date hidden | 8 | 135 | 132 | 142 | |
+| ResNet34 + station/date | 17 | 139 | 112 | 139 | 27 min |
+| &nbsp;&nbsp;same model, station/date hidden | 11 | 133 | 112 | 138 | |
+| ResNet50 + station/date, seed 42 | 23 | 148 | 121 | 145 | 45 min |
+| &nbsp;&nbsp;same model, station/date hidden | 23 | 148 | 122 | 145 | |
+| ResNet50 + station/date, seed 7 | 22 | 145 | 116 | 136 | 45 min |
+| &nbsp;&nbsp;same model, station/date hidden | 17 | 135 | 112 | 135 | |
+| ConvNeXt-Tiny + station/date (batch 24) | 18 | 142 | 93 | 132 | 52 min |
+| &nbsp;&nbsp;same model, station/date hidden | 16 | 127 | 80 | 127 | |
+
+What this shows:
+
+* **Retraining noise is large.** The same ResNet18 setup found 114-130 burst
+  files at 2% FA depending on the seed. A difference under about 8 files between
+  two single runs means nothing.
+* **The deeper backbones do not detect better on this data.** Averaged over
+  seeds, ResNet18 found 119 / 140 (2% / 5% FA) and ResNet50 118.5 / 140.5, at
+  2.5 times the training time and GPU memory; ResNet34 sat at the low end of the
+  ResNet18 range and ConvNeXt-Tiny clearly below it (93 / 132). ResNet18 stays
+  the default; the others are there to re-test as the labelled set grows -- with
+  about 1,300 burst files, a larger network has little more to learn from.
+* **Station/date gives the bounded dependency it is designed to, but no
+  measurable detection gain for a good image model.** With it on vs hidden in
+  the same ResNet, at equal false alarms: +2, -2, 0, -1, +4 burst files at 2% FA;
+  -1, +1, +1, 0, +1 at 5%. Only the weakest image model, ConvNeXt-Tiny, gained
+  clearly (+13 / +5). At the operating point it changes 6-17 of 524 verdicts,
+  mostly by raising scores slightly at stations with many labelled bursts (BIR,
+  GREENLAND, ALASKA, SSRT) -- the file-selection signal the cap is there to
+  contain. It is on by
+  default because the station's own interference is real signal that more labels
+  per station should let it learn; switch it off in the Train tab if you prefer.
+* The verdict counts at the calibrated threshold move with where calibration
+  landed (19-23 false alarms on test for a 5% validation budget = 5.7-6.9%), so
+  compare models on the fixed-FA columns.
 
 ### Calibrated to a false-alarm budget
 
@@ -971,7 +1095,7 @@ and runnable from the command line, e.g.
 .venv\Scripts\python -m pytest tests/ -q
 ```
 
-512 tests. The ones that matter most:
+526 tests. The ones that matter most:
 
 | File | Guards |
 |---|---|
@@ -989,6 +1113,7 @@ and runnable from the command line, e.g.
 | `test_quiet_view.py` | a long continuum stays bright in the quiet background and a short burst looks the same; the third view is built identically by export, prediction, the bundle script and the Label tab; a three-view model refuses to run without it |
 | `test_burst_parameters.py` | a Type II / III box's drift is (f_start − f_end)/(t_start − t_end) from its top-left to bottom-right; other types get none; drawing, resizing, retyping and reopening recalculate; predicted Type II / III regions report the same |
 | `test_overlapping_boxes.py` | the smallest box owns a shared pixel; a burst inside a bigger box takes its type; same-type boxes count together; a region split between two types is left out; negatives and detections use all the boxes at once |
+| `test_rfi_reporting.py` | a file with a burst and RFI is Burst and lists the RFI; a file with only RFI is No_Burst; RFI and No_Burst are one class in reports; segments on the same channels are one interference source; deleting over 2 GiB of snapshots reports it |
 | `test_type_priors.py` | each interference signature is named RFI and a drifting burst is not; the type correction never changes burst evidence, turns an unsure burst into the commoner type and leaves a confident rare one alone |
 
 Tests needing real FITS files use the archive on `H:` and skip if it is absent.

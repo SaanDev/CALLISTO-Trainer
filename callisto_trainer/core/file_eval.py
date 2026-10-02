@@ -103,6 +103,10 @@ class FileScore:
     stray_scores: list[float] = field(default_factory=list)
     regions_examined: int = 0
     error: str | None = None
+    # Model with a station/date correction only: the two scores above with
+    # station and date hidden.
+    image_only_file_score: float | None = None
+    image_only_on_burst_score: float | None = None
 
 
 def lands_on_burst(region: Sequence[int], burst_boxes: Sequence[Sequence[Any]]) -> bool:
@@ -126,6 +130,8 @@ def score_files(
     from callisto_trainer.core.crops import normalize_full_spectrum
     from callisto_trainer.core.fits_reader import read_fits_spectrum_and_axes
 
+    encoder = getattr(predictor, "encoder", None)
+    uses_station_date = encoder is not None and encoder.spec.station_date is not None
     scores: list[FileScore] = []
     for index, truth in enumerate(truths):
         if progress is not None and progress(index, len(truths), truth.file_name) is False:
@@ -142,7 +148,7 @@ def score_files(
             axes = SpectrumAxes.from_metadata(metadata)
             regions = predictor.examine(
                 normalized, axes, rfi_channels=metadata.get("rfi_channels_mhz"),
-                quiet=predictor.quiet_for(spectrum),
+                quiet=predictor.quiet_for(spectrum), file_meta=metadata,
             )
         except Exception as exc:
             score.error = repr(exc)
@@ -151,6 +157,10 @@ def score_files(
             continue
 
         score.regions_examined = len(regions)
+        if uses_station_date:
+            # Scored both ways even when the finder proposed nothing.
+            score.image_only_file_score = 0.0
+            score.image_only_on_burst_score = 0.0
         for region in regions:
             evidence = float(region.burst_evidence or 0.0)
             score.file_score = max(score.file_score, evidence)
@@ -160,6 +170,13 @@ def score_files(
                 score.on_burst_score = max(score.on_burst_score, evidence)
             elif truth.is_burst:
                 score.stray_scores.append(evidence)
+            if uses_station_date and region.image_only_evidence is not None:
+                image_only = float(region.image_only_evidence)
+                score.image_only_file_score = max(score.image_only_file_score, image_only)
+                if on_burst:
+                    score.image_only_on_burst_score = max(
+                        score.image_only_on_burst_score, image_only
+                    )
         scores.append(score)
     return scores
 
@@ -294,6 +311,59 @@ def file_level_report(scores: Sequence[FileScore], threshold: float) -> dict[str
             {"file_path": s.file_path, "station": s.station, "score": s.on_burst_score}
             for s in sorted(missed, key=lambda s: s.on_burst_score)
         ],
+        **station_date_effect(valid, threshold),
+    }
+
+
+def station_date_effect(scores: Sequence[FileScore], threshold: float) -> dict[str, Any]:
+    """Which verdicts station and date changed at ``threshold``, for such a model.
+
+    Empty for a model without a station/date correction. Otherwise the same
+    files are judged twice -- as scored, and with station and date hidden --
+    and every file whose verdict differs is listed, so the operator can see
+    how much the model leaned on them, and where.
+    """
+    judged = [s for s in scores if s.image_only_file_score is not None]
+    if not judged:
+        return {}
+
+    def entry(s: FileScore, with_meta: float, without: float) -> dict[str, Any]:
+        return {"file_path": s.file_path, "station": s.station,
+                "score": with_meta, "image_only_score": without}
+
+    quiet = [s for s in judged if not s.is_burst]
+    bursts = [s for s in judged if s.is_burst]
+    flagged_by = [
+        entry(s, s.file_score, s.image_only_file_score) for s in quiet
+        if s.file_score >= threshold > s.image_only_file_score
+    ]
+    cleared_by = [
+        entry(s, s.file_score, s.image_only_file_score) for s in quiet
+        if s.image_only_file_score >= threshold > s.file_score
+    ]
+    found_by = [
+        entry(s, s.on_burst_score, s.image_only_on_burst_score or 0.0) for s in bursts
+        if s.on_burst_score >= threshold > (s.image_only_on_burst_score or 0.0)
+    ]
+    lost_by = [
+        entry(s, s.on_burst_score, s.image_only_on_burst_score or 0.0) for s in bursts
+        if (s.image_only_on_burst_score or 0.0) >= threshold > s.on_burst_score
+    ]
+    return {
+        "station_date_effect": {
+            "files": len(judged),
+            "verdicts_changed": len(flagged_by) + len(cleared_by) + len(found_by) + len(lost_by),
+            "image_only_false_alarms": sum(
+                1 for s in quiet if s.image_only_file_score >= threshold
+            ),
+            "image_only_bursts_detected": sum(
+                1 for s in bursts if (s.image_only_on_burst_score or 0.0) >= threshold
+            ),
+            "false_alarms_added": flagged_by,
+            "false_alarms_removed": cleared_by,
+            "bursts_found_only_with_it": found_by,
+            "bursts_lost_to_it": lost_by,
+        }
     }
 
 

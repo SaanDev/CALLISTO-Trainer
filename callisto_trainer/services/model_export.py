@@ -227,6 +227,27 @@ def build_model_card(
                     "measured in training, so all zeros is out of distribution: use "
                     "this project (CascadePredictor) to run the model on real files."
                 )
+            station_date = model_cfg.get("station_date") or {}
+            if bool(station_date.get("enabled", False)):
+                from callisto_trainer.core.metadata_features import STATION_DATE_FEATURES
+
+                names = names + list(STATION_DATE_FEATURES)
+                card["station_date_input"] = {
+                    "position": f"the last {len(STATION_DATE_FEATURES)} values of the second input",
+                    "order": list(STATION_DATE_FEATURES),
+                    "station_vocab": dict(station_date.get("station_vocab") or {}),
+                    "year_range": list(station_date.get("year_range") or []),
+                    "max_log_odds_shift": float(station_date.get("cap", 1.0)),
+                    "encoding": (
+                        "station_index: the station's index in station_vocab after "
+                        "trimming and upper-casing the FITS INSTRUME name, 0 when it is "
+                        "not listed. month_sin/cos: sin/cos(2*pi*(month - 0.5)/12). "
+                        "year: year + (month - 0.5)/12, clamped to year_range and scaled "
+                        "to [-1, 1]. date_known: 1 when the date parsed. All five zero "
+                        "means unknown station and date, which turns the station/date "
+                        "correction off exactly."
+                    ),
+                }
             card["physics_input"] = {
                 "required": True,
                 "feature_set": feature_set,
@@ -433,11 +454,15 @@ def main():
                           "decision_threshold": threshold}, indent=2))
     else:
         probs = torch.softmax(logits.reshape(1, -1), dim=1)[0].numpy()
-        names = CARD["classes"]
-        best = int(probs.argmax())
-        result = {"file": sys.argv[1], "burst_type": names[best],
-                  "confidence": float(probs[best]),
-                  "probabilities": {n: float(p) for n, p in zip(names, probs)}}
+        names = list(CARD["classes"])
+        values = {n: float(p) for n, p in zip(names, probs)}
+        # RFI and No_Burst are reported as one "not a burst" (the model keeps
+        # them apart only because training them apart cut false alarms).
+        if "RFI" in values and "No_Burst" in values:
+            values["No_Burst"] += values.pop("RFI")
+        best = max(values, key=values.get)
+        result = {"file": sys.argv[1], "burst_type": best,
+                  "confidence": values[best], "probabilities": values}
         # This model was trained on crops around a single burst. Handed a whole
         # recording it will still answer, confidently and meaninglessly, so say
         # so rather than let the number be quoted.
@@ -604,7 +629,9 @@ def export_torchscript(
         views = len(model_cfg.get("views") or ["crop"])
         example: tuple[Any, ...] = (torch.zeros(1, views, int(shape[0]), int(shape[1])),)
         if uses_physics:
-            example = (*example, torch.zeros(1, int(kwargs["num_physics"])))
+            from callisto_trainer.core.models.model_factory import feature_input_width
+
+            example = (*example, torch.zeros(1, feature_input_width(model_cfg)))
         elif uses_metadata:
             from callisto_trainer.core.metadata_features import META_VECTOR_LEN
 

@@ -17,6 +17,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from callisto_trainer.core.dataset import CallistoBurstDataset
+from callisto_trainer.core.region_inputs import RegionInputSpec
 from callisto_trainer.core.type_metrics import compute_multiclass_metrics
 from callisto_trainer.core.models.model_factory import create_model
 from callisto_trainer.core.config import load_config
@@ -108,6 +109,7 @@ def split_dataloader(checkpoint_config: dict[str, Any], split: str) -> DataLoade
         split=split,
         return_physics_features=bool(checkpoint_config["model"].get("use_physics", False)),
         feature_set=checkpoint_config["model"].get("feature_set"),
+        station_date=RegionInputSpec.from_config(checkpoint_config).station_date,
     )
     return DataLoader(
         dataset,
@@ -182,7 +184,7 @@ def save_misclassified_files(
             writer.writerow(
                 {
                     "file_path": row["file_path"],
-                    "label": row.get("label", class_names[int(true_label)]),
+                    "label": class_names[int(true_label)],
                     "label_id": row.get("label_id", int(true_label)),
                     "predicted_label": class_names[int(predicted_label)],
                     "predicted_label_id": int(predicted_label),
@@ -237,6 +239,11 @@ def evaluate_type_model(
     dataset = dataloader.dataset
 
     y_true, y_pred = _predict_dataset(model, dataloader, device)
+    # The unified model's RFI and No_Burst are reported as one "not a burst".
+    from callisto_trainer.core.unified_metrics import merge_rejections
+
+    y_true, _ = merge_rejections(y_true, class_names)
+    y_pred, class_names = merge_rejections(y_pred, class_names)
     metrics = compute_multiclass_metrics(y_true, y_pred, class_names)
 
     reports_dir = Path(checkpoint_config["paths"]["reports_dir"])

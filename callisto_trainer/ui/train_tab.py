@@ -41,6 +41,15 @@ LOGGER = get_logger(__name__)
 # metrics, and an empty train split makes the class-weight computation raise.
 MIN_SAMPLES_PER_SPLIT = 2
 
+# The largest batch (regions of three views each) the deeper backbones train with
+# inside an 8 GB GPU under mixed precision, measured on an RTX 5060. Above it
+# Windows does not fail with out-of-memory: it quietly spills into system memory
+# and training runs several times slower -- ConvNeXt-Tiny at 32 started at 7.5 GB,
+# crept over after nine epochs and went from 3 to 13 minutes an epoch. Choosing
+# one of these backbones lowers the batch size to fit; it can be raised again on
+# a larger card.
+MAX_BATCH_8GB = {"resnet50": 32, "convnext_tiny": 24}
+
 
 class TrainTab(QWidget):
     """Configure and run training, with live loss and score curves."""
@@ -51,7 +60,9 @@ class TrainTab(QWidget):
         super().__init__(parent)
         self.settings = settings
         self.runner = TrainingRunner(settings.project_root, self)
-        self._history: dict[str, list[float]] = {}
+        self._history: dict[str, list[float]] = {
+            "train_loss": [], "val_loss": [], "score": [], "epoch": []
+        }
         self._epoch_records: list[dict] = []
 
         layout = QVBoxLayout(self)
@@ -108,7 +119,11 @@ class TrainTab(QWidget):
         form = QFormLayout(group)
 
         self.backbone = QComboBox()
-        self.backbone.addItems(["resnet18", "efficientnet_b0", "mobilenet_v3_small", "simple_cnn"])
+        self.backbone.addItems(
+            ["resnet18", "resnet34", "resnet50", "convnext_tiny", "efficientnet_b0",
+             "mobilenet_v3_small", "simple_cnn"]
+        )
+        self.backbone.activated.connect(self._on_backbone_chosen)
         self.epochs = QSpinBox()
         self.epochs.setRange(1, 500)
         self.batch_size = QSpinBox()
@@ -134,6 +149,22 @@ class TrainTab(QWidget):
         self.augment = QComboBox()
         self.augment.addItem("On", True)
         self.augment.addItem("Off", False)
+        # Unified models only: how far the file's station and date may move a
+        # decision (see models/physics_model.py, StationDateCorrection).
+        self.station_date = QComboBox()
+        self.station_date.addItem("Off - image and region features only", 0.0)
+        self.station_date.addItem("Light - log-odds shift up to 0.5", 0.5)
+        self.station_date.addItem("Moderate - log-odds shift up to 1", 1.0)
+        self.station_date.addItem("Strong - log-odds shift up to 2", 2.0)
+        self.station_date.setToolTip(
+            "Lets the model use the file's station and observation month/year as a "
+            "bounded correction on top of what the spectrogram shows.\n\n"
+            "The cap is the most it can move the odds of any decision: at 1, a region "
+            "the image puts at 50% can end up between 27% and 73%, and one at 95% no "
+            "lower than 87%. Labelled burst rates per station mostly reflect which "
+            "files were picked for labelling, which is why the influence is capped.\n\n"
+            "Unified snapshots only."
+        )
 
         form.addRow("Backbone", self.backbone)
         form.addRow("Epochs", self.epochs)
@@ -142,6 +173,7 @@ class TrainTab(QWidget):
         form.addRow("Early-stop patience", self.patience)
         form.addRow("Weights", self.pretrained)
         form.addRow("Augmentation", self.augment)
+        form.addRow("Station + date", self.station_date)
         outer.addWidget(group)
 
         self.dataset_summary = QLabel("")
@@ -222,6 +254,12 @@ class TrainTab(QWidget):
     def current_snapshot(self) -> Path | None:
         return self.snapshot.currentData()
 
+    def _on_backbone_chosen(self) -> None:
+        """Lower the batch size to one the chosen backbone trains with on 8 GB."""
+        limit = MAX_BATCH_8GB.get(self.backbone.currentText())
+        if limit is not None and self.batch_size.value() > limit:
+            self.batch_size.setValue(limit)
+
     def _on_snapshot_changed(self) -> None:
         directory = self.current_snapshot()
         if directory is None:
@@ -283,6 +321,11 @@ class TrainTab(QWidget):
         self.augment.setCurrentIndex(
             0 if config.get("augmentation", {}).get("enabled", True) else 1
         )
+        station_date = model.get("station_date") or {}
+        cap = float(station_date.get("cap", 1.0)) if station_date.get("enabled") else 0.0
+        index = self.station_date.findData(cap)
+        self.station_date.setCurrentIndex(index if index >= 0 else 0)
+        self.station_date.setEnabled(bool(model.get("use_physics", False)))
 
     def _write_run_config(self, directory: Path) -> Path:
         """Persist the edited settings beside the snapshot so the run is reproducible."""
@@ -297,6 +340,13 @@ class TrainTab(QWidget):
         config["training"]["learning_rate"] = self.learning_rate.value()
         config["training"]["patience"] = self.patience.value()
         config["augmentation"]["enabled"] = bool(self.augment.currentData())
+        if config["model"].get("use_physics", False):
+            cap = float(self.station_date.currentData())
+            section = dict(config["model"].get("station_date") or {})
+            section["enabled"] = cap > 0
+            if cap > 0:
+                section["cap"] = cap
+            config["model"]["station_date"] = section
 
         with config_path.open("w", encoding="utf-8") as handle:
             yaml.safe_dump(config, handle, sort_keys=False, default_flow_style=False)
@@ -316,12 +366,15 @@ class TrainTab(QWidget):
             return
 
         config_path = self._write_run_config(directory)
-        self._history = {"train_loss": [], "val_loss": [], "score": [], "epoch": []}
-        self._epoch_records = []
+        self._reset_history()
         self.log.clear()
         self._append_log(f"Config: {config_path}")
 
         self.runner.start(TrainingJob.train(task_for_kind(self.kind.currentData()), config_path))
+
+    def _reset_history(self) -> None:
+        self._history = {"train_loss": [], "val_loss": [], "score": [], "epoch": []}
+        self._epoch_records = []
 
     def _on_started(self, job: TrainingJob) -> None:
         self.start_button.setEnabled(False)

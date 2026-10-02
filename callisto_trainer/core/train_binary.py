@@ -408,7 +408,7 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
     device = _device(config)
     use_amp = bool(perf_cfg.get("mixed_precision", True)) and device.type == "cuda"
     amp_dtype = _amp_dtype(str(perf_cfg.get("amp_dtype", "float16")))
-    channels_last = bool(perf_cfg.get("channels_last", True)) and device.type == "cuda"
+    channels_last = bool(perf_cfg.get("channels_last", False)) and device.type == "cuda"
     dataloaders = get_dataloaders(config)
     use_metadata = bool(config["model"].get("use_metadata", False))
     metadata_kwargs: dict[str, Any] = {}

@@ -198,21 +198,24 @@ def _largest_component(mask: np.ndarray) -> np.ndarray:
 
 
 def _theil_sen(x: np.ndarray, y: np.ndarray) -> float | None:
-    """Median of pairwise slopes: robust to the outliers interference produces."""
-    if x.size < 2:
-        return None
-    try:
-        from scipy import stats
+    """Median of pairwise slopes: robust to the outliers interference produces.
 
-        return float(stats.theilslopes(y, x)[0])
-    except ImportError:  # pragma: no cover
-        slopes = []
-        for i in range(x.size):
-            dx = x[i + 1 :] - x[i]
-            valid = dx != 0
-            if valid.any():
-                slopes.extend(((y[i + 1 :] - y[i])[valid] / dx[valid]).tolist())
-        return float(np.median(slopes)) if slopes else None
+    The slope ``scipy.stats.theilslopes`` returns, computed the same way (every
+    pair with a positive x step), without the confidence interval scipy also
+    computes and this never uses: with the many repeated times of a track
+    followed along frequency, that interval takes the square root of a negative
+    number and warns. None when every ``x`` is the same -- a track confined to
+    one time sample, a one-sample spike, has no slope (scipy warns four times
+    over and returns NaN).
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if x.size < 2 or float(np.ptp(x)) == 0.0:
+        return None
+    dx = x[:, np.newaxis] - x
+    dy = y[:, np.newaxis] - y
+    rising = dx > 0
+    return float(np.median(dy[rising] / dx[rising]))
 
 
 def _spearman(x: np.ndarray, y: np.ndarray) -> float:
@@ -402,6 +405,9 @@ def measure_burst(
         physics.confidence = "none"
         return physics
 
+    if float(np.ptp(track_t)) == 0.0:
+        physics.note = "the whole track lies in one time sample, so it has no drift to fit"
+        return physics
     slope = _theil_sen(track_t, track_f)
     if slope is None or not math.isfinite(slope):
         physics.note = "drift fit did not converge"

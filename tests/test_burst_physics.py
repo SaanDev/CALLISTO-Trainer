@@ -470,3 +470,40 @@ def test_measures_real_annotations_with_physical_values(axes_files) -> None:
             assert 0.0 <= (physics.fit_quality or 0.0) <= 1.0
 
     assert measured > 0, "no region in any real file yielded a measurement"
+
+
+# -- fit edge cases (no warnings in evaluation logs) -------------------------------
+
+
+def test_a_track_in_one_time_sample_has_no_drift_and_no_warning() -> None:
+    import warnings
+
+    from callisto_trainer.core.burst_physics import _theil_sen, measure_burst
+    from callisto_trainer.core.coords import SpectrumAxes
+
+    rng = np.random.default_rng(0)
+    array = np.clip(rng.normal(0.12, 0.03, (200, 3600)), 0, 1).astype(np.float32)
+    array[10:190, 1000] = 0.95                       # a one-sample spike
+    axes = SpectrumAxes(time_s=np.arange(3600) * 0.25, freq_mhz=np.linspace(80, 20, 200))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert _theil_sen(np.full(8, 3.0), np.arange(8.0)) is None
+        physics = measure_burst(array, axes, 5, 195, 990, 1010)
+    assert not physics.measured and "one time sample" in physics.note
+
+
+def test_repeated_times_fit_without_warnings_and_match_scipy() -> None:
+    import warnings
+
+    from scipy import stats
+
+    from callisto_trainer.core.burst_physics import _theil_sen
+
+    x = np.repeat([10.0, 10.25, 10.5], 20)           # a track followed along frequency
+    y = np.linspace(80, 20, x.size)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        expected = float(stats.theilslopes(y, x)[0])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert _theil_sen(x, y) == pytest.approx(expected)

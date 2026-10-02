@@ -29,7 +29,7 @@ from callisto_trainer.core.dataset import get_dataloaders
 from callisto_trainer.core.type_metrics import compute_multiclass_metrics
 from callisto_trainer.core.models.model_factory import create_model, model_kwargs_from_config
 from callisto_trainer.core.taxonomy import NO_BURST, NON_BURST_LABELS
-from callisto_trainer.core.unified_metrics import unified_region_metrics
+from callisto_trainer.core.unified_metrics import merge_rejections, unified_region_metrics
 from callisto_trainer.core.train_binary import (
     _amp_dtype,
     _autocast,
@@ -230,7 +230,11 @@ def _run_epoch(
     y_pred = np.concatenate(pred_chunks) if pred_chunks else np.asarray([], dtype=np.int64)
     y_true = np.concatenate(label_chunks) if label_chunks else np.asarray([], dtype=np.int64)
 
-    metrics = compute_multiclass_metrics(y_true, y_pred, class_names)
+    # Accuracy and macro-F1 as the operator reads them: RFI and No_Burst are one
+    # "not a burst" (the loss and the ranking metrics below keep them apart).
+    shown_true, shown_names = merge_rejections(y_true, class_names)
+    shown_pred, _ = merge_rejections(y_pred, class_names)
+    metrics = compute_multiclass_metrics(shown_true, shown_pred, shown_names)
     if keep_probabilities and prob_chunks:
         metrics.update(
             unified_region_metrics(y_true, np.concatenate(prob_chunks), class_names)
@@ -267,8 +271,9 @@ def fit_type(config: dict[str, Any]) -> dict[str, Any]:
 
     if bool(config["model"].get("use_metadata", False)):
         raise ValueError(
-            "The multiclass model does not use station metadata; set "
-            "model.use_metadata: false (model.use_physics is the branch you want)."
+            "The multiclass model does not use the old station metadata branch; set "
+            "model.use_metadata: false. Station and date reach the unified model "
+            "through model.station_date."
         )
 
     class_names = _ordered_class_names(config)
@@ -277,7 +282,7 @@ def fit_type(config: dict[str, Any]) -> dict[str, Any]:
     device = _device(config)
     use_amp = bool(perf_cfg.get("mixed_precision", True)) and device.type == "cuda"
     amp_dtype = _amp_dtype(str(perf_cfg.get("amp_dtype", "float16")))
-    channels_last = bool(perf_cfg.get("channels_last", True)) and device.type == "cuda"
+    channels_last = bool(perf_cfg.get("channels_last", False)) and device.type == "cuda"
     dataloaders = get_dataloaders(config)
 
     # Trainer addition: an optional physics branch (measured drift rate, burst
@@ -291,6 +296,12 @@ def fit_type(config: dict[str, Any]) -> dict[str, Any]:
             config["model"].get("feature_set") or "physics_v1",
             branch_kwargs["num_physics"],
             config["model"].get("views") or ["crop"],
+        )
+    if branch_kwargs.get("station_date"):
+        LOGGER.info(
+            "Station/date correction enabled: %d station slot(s), log-odds shift capped at %.2f",
+            branch_kwargs["station_date"]["num_stations"],
+            branch_kwargs["station_date"]["cap"],
         )
 
     model = create_model(

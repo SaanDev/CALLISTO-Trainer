@@ -18,6 +18,14 @@ from callisto_trainer.core.logging_utils import get_logger
 
 LOGGER = get_logger(__name__)
 
+# Trainer addition: the deeper ResNets and ConvNeXt-Tiny, for the unified model.
+# All torchvision backbones are built the same way -- constructor, stem conv
+# adapted to the input channels, final Linear replaced -- so they are grouped by
+# the attribute holding that final layer: ``fc`` for ResNets, ``classifier[-1]``
+# for the rest.
+RESNETS = ("resnet18", "resnet34", "resnet50")
+CLASSIFIER_HEAD_BACKBONES = ("efficientnet_b0", "mobilenet_v3_small", "convnext_tiny")
+
 
 def _instantiate_tv(model_fn, pretrained: bool):
     """Build a torchvision model, returning ``(model, used_pretrained)``.
@@ -136,10 +144,16 @@ def _apply_dropout(model: nn.Module, normalized_name: str, dropout: float) -> No
     if dropout <= 0:
         return
 
-    if normalized_name == "resnet18":
+    if normalized_name in RESNETS:
         # ResNet has no dropout anywhere; the pooled feature vector feeding fc is
         # the one place it belongs.
         model.avgpool = nn.Sequential(model.avgpool, nn.Dropout(dropout))
+        return
+
+    if normalized_name == "convnext_tiny":
+        # ConvNeXt's head is LayerNorm -> Flatten -> Linear with no dropout; it
+        # goes in front of the Linear, as in ResNet.
+        model.classifier[-1] = nn.Sequential(nn.Dropout(dropout), model.classifier[-1])
         return
 
     # EfficientNet and MobileNet already ship a Dropout in their classifier;
@@ -176,22 +190,15 @@ def _build_image_classifier(
             "Install dependencies with: pip install -r requirements.txt"
         ) from exc
 
-    if normalized_name == "resnet18":
-        model, used_pretrained = _instantiate_tv(tv_models.resnet18, pretrained)
+    if normalized_name in RESNETS:
+        model, used_pretrained = _instantiate_tv(getattr(tv_models, normalized_name), pretrained)
         _prepare_first_conv(model, in_channels, used_pretrained)
         model.fc = nn.Linear(model.fc.in_features, num_classes)
         _apply_dropout(model, normalized_name, dropout)
         return model
 
-    if normalized_name == "efficientnet_b0":
-        model, used_pretrained = _instantiate_tv(tv_models.efficientnet_b0, pretrained)
-        _prepare_first_conv(model, in_channels, used_pretrained)
-        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
-        _apply_dropout(model, normalized_name, dropout)
-        return model
-
-    if normalized_name == "mobilenet_v3_small":
-        model, used_pretrained = _instantiate_tv(tv_models.mobilenet_v3_small, pretrained)
+    if normalized_name in CLASSIFIER_HEAD_BACKBONES:
+        model, used_pretrained = _instantiate_tv(getattr(tv_models, normalized_name), pretrained)
         _prepare_first_conv(model, in_channels, used_pretrained)
         model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
         _apply_dropout(model, normalized_name, dropout)
@@ -219,28 +226,57 @@ def create_backbone(
             "Install dependencies with: pip install -r requirements.txt"
         ) from exc
 
-    if normalized_name == "resnet18":
-        model, used_pretrained = _instantiate_tv(tv_models.resnet18, pretrained)
+    if normalized_name in RESNETS:
+        model, used_pretrained = _instantiate_tv(getattr(tv_models, normalized_name), pretrained)
         _prepare_first_conv(model, in_channels, used_pretrained)
         feature_dim = model.fc.in_features
         model.fc = nn.Identity()
         return model, feature_dim
 
-    if normalized_name == "efficientnet_b0":
-        model, used_pretrained = _instantiate_tv(tv_models.efficientnet_b0, pretrained)
-        _prepare_first_conv(model, in_channels, used_pretrained)
-        feature_dim = model.classifier[-1].in_features
-        model.classifier[-1] = nn.Identity()
-        return model, feature_dim
-
-    if normalized_name == "mobilenet_v3_small":
-        model, used_pretrained = _instantiate_tv(tv_models.mobilenet_v3_small, pretrained)
+    if normalized_name in CLASSIFIER_HEAD_BACKBONES:
+        model, used_pretrained = _instantiate_tv(getattr(tv_models, normalized_name), pretrained)
         _prepare_first_conv(model, in_channels, used_pretrained)
         feature_dim = model.classifier[-1].in_features
         model.classifier[-1] = nn.Identity()
         return model, feature_dim
 
     raise ValueError(f"Unsupported model name: {name}")
+
+
+def station_date_kwargs(model_cfg: dict) -> dict | None:
+    """``StationDateCorrection`` arguments for ``model.station_date``, or None.
+
+    The station list is fitted on the training split when training starts (see
+    ``core/dataset.py``) and saved in the checkpoint's config; the embedding has
+    one row per known station plus the unknown slot.
+    """
+    section = model_cfg.get("station_date") or {}
+    if not bool(section.get("enabled", False)):
+        return None
+    from callisto_trainer.core.metadata_features import StationDateEncoder
+
+    hide = section.get("hide") or {}
+    return dict(
+        num_stations=StationDateEncoder.from_config(section).num_stations,
+        cap=float(section.get("cap", 1.0)),
+        station_emb_dim=int(section.get("station_emb_dim", 8)),
+        drop_all=float(hide.get("both", 0.25)),
+        drop_station=float(hide.get("station", 0.15)),
+        drop_date=float(hide.get("date", 0.15)),
+    )
+
+
+def feature_input_width(model_cfg: dict) -> int:
+    """Width of the ``features`` tensor a physics/region model is called with."""
+    kwargs = model_kwargs_from_config(model_cfg)
+    if not kwargs.get("use_physics"):
+        return 0
+    width = int(kwargs["num_physics"])
+    if kwargs.get("station_date"):
+        from callisto_trainer.core.metadata_features import STATION_DATE_LEN
+
+        width += STATION_DATE_LEN
+    return width
 
 
 def model_kwargs_from_config(model_cfg: dict) -> dict:
@@ -259,11 +295,15 @@ def model_kwargs_from_config(model_cfg: dict) -> dict:
         )
 
         feature_set = str(model_cfg.get("feature_set") or FEATURE_SET_PHYSICS_V1)
-        return dict(
+        kwargs: dict = dict(
             use_physics=True,
             num_physics=feature_count(feature_set),
             num_views=len(model_cfg.get("views") or ["crop"]),
         )
+        station_date = station_date_kwargs(model_cfg)
+        if station_date:
+            kwargs["station_date"] = station_date
+        return kwargs
     if bool(model_cfg.get("use_metadata", False)):
         from callisto_trainer.core.metadata_features import NUM_NUMERIC
 
@@ -291,6 +331,7 @@ def create_model(
     use_physics: bool = False,
     num_physics: int = 8,
     num_views: int = 1,
+    station_date: dict | None = None,
 ) -> nn.Module:
     """Create an image classifier by name.
 
@@ -319,7 +360,7 @@ def create_model(
         backbone, feature_dim = create_backbone(
             name, in_channels=in_channels, dropout=dropout, pretrained=pretrained
         )
-        if int(num_views) > 1:
+        if int(num_views) > 1 or station_date:
             # Each view is a single-channel image through the shared backbone.
             return RegionContextModel(
                 backbone,
@@ -328,6 +369,7 @@ def create_model(
                 num_features=int(num_physics),
                 num_classes=int(num_classes),
                 dropout=dropout,
+                station_date=station_date,
             )
         return PhysicsConditionedModel(
             backbone,

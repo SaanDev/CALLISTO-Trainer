@@ -717,8 +717,10 @@ def _fixed(predictor, row: dict[str, float]):
     original = predictor._unified_probabilities
     vector = np.array([row.get(name, 0.0) for name in predictor.unified_class_names])
 
-    def fake(normalized, axes, boxes, rfi_channels=None, quiet=None):
-        _, encoded = original(normalized, axes, boxes, rfi_channels, quiet=quiet)
+    def fake(normalized, axes, boxes, rfi_channels=None, quiet=None, file_meta=None):
+        _, encoded = original(
+            normalized, axes, boxes, rfi_channels, quiet=quiet, file_meta=file_meta
+        )
         return np.tile(vector, (len(boxes), 1)), encoded
 
     return fake
@@ -990,9 +992,11 @@ def test_hard_negative_mining_uses_the_checkpoint(labelled, tmp_path: Path, monk
     calls: list[int] = []
     original = CascadePredictor.burst_evidence_for
 
-    def spy(self, normalized, axes, boxes, rfi_channels=None, quiet=None):
+    def spy(self, normalized, axes, boxes, rfi_channels=None, quiet=None, file_meta=None):
         calls.append(len(boxes))
-        return original(self, normalized, axes, boxes, rfi_channels, quiet=quiet)
+        return original(
+            self, normalized, axes, boxes, rfi_channels, quiet=quiet, file_meta=file_meta
+        )
 
     monkeypatch.setattr(CascadePredictor, "burst_evidence_for", spy)
     result = _export(

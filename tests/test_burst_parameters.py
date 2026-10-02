@@ -218,8 +218,10 @@ def test_a_predicted_type_iii_region_reports_the_box_drift(tmp_path: Path, monke
     vector = np.array([0.9 if name == TYPE_III else 0.1 / (len(UNIFIED_CLASSES) - 1)
                        for name in predictor.unified_class_names])
 
-    def fake(normalized, axes, boxes, rfi_channels=None, quiet=None):
-        _, encoded = original(normalized, axes, boxes, rfi_channels, quiet=quiet)
+    def fake(normalized, axes, boxes, rfi_channels=None, quiet=None, file_meta=None):
+        _, encoded = original(
+            normalized, axes, boxes, rfi_channels, quiet=quiet, file_meta=file_meta
+        )
         return np.tile(vector, (len(boxes), 1)), encoded
 
     monkeypatch.setattr(predictor, "_unified_probabilities", fake)

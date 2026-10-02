@@ -27,6 +27,7 @@ from callisto_trainer.settings import AppSettings
 from callisto_trainer.store.export import (
     DEFAULT_QUIET_VIEW,
     SNAPSHOT_KINDS,
+    describe_class_counts,
     ExportResult,
     delete_snapshot,
     export_binary_dataset,
@@ -71,7 +72,9 @@ class _DeleteWorker(QThread):
     """
 
     progress = Signal(int, int, str)
-    finished_with = Signal(int, list)  # bytes freed, [(name, message)]
+    # Bytes freed travel as a Python object: a C++ int is 32 bits, and deleting a
+    # few snapshots frees well over 2 GiB (10,025,980,020 bytes overflowed it).
+    finished_with = Signal(object, list)  # bytes freed, [(name, message)]
 
     def __init__(self, datasets_dir, directories: Sequence[Path]) -> None:
         super().__init__()
@@ -200,15 +203,17 @@ class DatasetTab(QWidget):
         self.export_unified = QPushButton("Export unified dataset  (recommended)")
         self.export_unified.setMinimumHeight(38)
         self.export_unified.setToolTip(
-            "One dataset over regions: No_Burst, RFI, Type II, Type III, Type IIIG, "
+            "One dataset over regions: not a burst, Type II, Type III, Type IIIG, "
             "Type IV, Other.\n"
             "Trains a single model that answers burst-or-not, which type, and where.\n"
             "Background samples are mined with the same region finder used at "
             "inference, outside your burst boxes and in no-burst files, so the model "
             "learns to reject the interference it will actually be shown. Those that "
             "measure like interference (carriers, impulses, sweeps, periodic signals, "
-            "gain steps) are labelled RFI automatically. Each sample carries the exact "
-            "crop, a wide context view and interference features."
+            "gain steps) are named RFI automatically and trained as their own "
+            "rejection class, which cut false alarms; everything reported counts them "
+            "with No_Burst. Each sample carries the exact crop, a wide context view "
+            "and interference features."
         )
         layout.addWidget(self.export_unified)
 
@@ -446,9 +451,7 @@ class DatasetTab(QWidget):
         self.table.setRowCount(len(rows))
         total_bytes = 0
         for index, (directory, info) in enumerate(rows):
-            classes = "  ".join(
-                f"{name}: {count:,}" for name, count in sorted(info.get("class_counts", {}).items())
-            )
+            classes = describe_class_counts(info.get("class_counts", {}))
             splits = "  ".join(
                 f"{name}: {count:,}" for name, count in sorted(info.get("split_counts", {}).items())
             )

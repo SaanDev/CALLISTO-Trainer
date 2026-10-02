@@ -604,7 +604,7 @@ class LabelTab(QWidget):
         bundle = self._current_bundle
         regions = self._scorer.examine(
             bundle.normalized, bundle.axes, rfi_channels=bundle.metadata.get("rfi_channels_mhz"),
-            quiet=self._scorer.quiet_for(bundle.raw),
+            quiet=self._scorer.quiet_for(bundle.raw), file_meta=bundle.metadata,
         )
         proposals, rejected = [], 0
         for region in regions:

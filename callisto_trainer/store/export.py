@@ -179,6 +179,30 @@ SNAPSHOT_KINDS: list[tuple[str, str, str]] = [
 ]
 
 
+def shown_class_counts(counts: dict[str, int]) -> dict[str, int]:
+    """Class counts as the operator reads them: RFI inside No_Burst.
+
+    The unified model trains RFI as its own rejection class (it cut false
+    alarms), but reports treat RFI and No_Burst as one "not a burst".
+    """
+    shown = {name: count for name, count in counts.items() if name != RFI}
+    if RFI in counts:
+        shown[NO_BURST] = shown.get(NO_BURST, 0) + counts[RFI]
+    return shown
+
+
+def describe_class_counts(counts: dict[str, int]) -> str:
+    """``No_Burst: 18,669 (RFI 10,256)  Type II: 882 ...`` for a snapshot."""
+    shown = shown_class_counts(counts)
+    parts = []
+    for name, count in sorted(shown.items()):
+        text = f"{name}: {count:,}"
+        if name == NO_BURST and counts.get(RFI):
+            text += f" (RFI {counts[RFI]:,})"
+        parts.append(text)
+    return "  ".join(parts)
+
+
 def task_for_kind(kind: str) -> str:
     """Trainer task name for a snapshot directory name."""
     for directory, _label, task in SNAPSHOT_KINDS:
@@ -225,8 +249,7 @@ class ExportResult:
     files_manifest_path: Path | None = None
 
     def summary(self) -> str:
-        classes = ", ".join(f"{name}: {count:,}" for name, count in sorted(self.class_counts.items()))
-        return f"{self.written:,} samples ({classes})"
+        return f"{self.written:,} samples ({describe_class_counts(self.class_counts)})"
 
     def blocking_problems(self, minimum_per_split: int = 1) -> list[str]:
         """Reasons this snapshot cannot be trained on, in plain language."""
@@ -256,11 +279,12 @@ class ExportResult:
         of its search range. The metrics look fine; the model misses real events.
         """
         warnings: list[str] = []
-        if not self.class_counts or len(self.class_counts) < 2:
+        counts = shown_class_counts(self.class_counts)
+        if not counts or len(counts) < 2:
             return warnings
 
-        largest = max(self.class_counts.items(), key=lambda item: item[1])
-        smallest = min(self.class_counts.items(), key=lambda item: item[1])
+        largest = max(counts.items(), key=lambda item: item[1])
+        smallest = min(counts.items(), key=lambda item: item[1])
         if smallest[1] == 0:
             return warnings
 
@@ -659,7 +683,7 @@ def export_unified_dataset(
         )
         LOGGER.info("Mining hard negatives with %s", hard_negative_checkpoint)
 
-    def hardness(normalized, axes, rfi, candidates, spectrum) -> list[float]:
+    def hardness(record, normalized, axes, rfi, candidates, spectrum) -> list[float]:
         if not candidates:
             return []
         if hard_negatives is None:
@@ -668,6 +692,7 @@ def export_unified_dataset(
             float(value) for value in hard_negatives.burst_evidence_for(
                 normalized, axes, [item.as_box() for item in candidates], rfi_channels=rfi,
                 quiet=hard_negatives.quiet_for(spectrum),
+                file_meta={"station": record.station, "date": record.obs_date},
             )
         ]
 
@@ -828,7 +853,7 @@ def export_unified_dataset(
                      quiet=quiet)
 
         background = [(i, r) for i, r in enumerate(assigned) if r.label == NO_BURST]
-        scores = hardness(normalized, axes, rfi, [r for _, r in background], spectrum)
+        scores = hardness(record, normalized, axes, rfi, [r for _, r in background], spectrum)
         for position, region in select_negatives(
             background, scores, per_burst, seed=record.id
         ):
@@ -853,7 +878,7 @@ def export_unified_dataset(
             normalized, threshold=resolve_threshold(normalized), min_area=DEFAULT_MIN_AREA,
             max_candidates=MINING_POOL,
         )
-        scores = hardness(normalized, axes, rfi, proposals, spectrum)
+        scores = hardness(record, normalized, axes, rfi, proposals, spectrum)
         for position, proposal in select_negatives(
             list(enumerate(proposals)), scores, per_quiet, seed=record.id
         ):
@@ -1210,6 +1235,7 @@ def write_training_config(
             DEFAULT_MIN_AREA,
             DEFAULT_REGION_THRESHOLD,
         )
+        from callisto_trainer.core.metadata_features import DEFAULT_MIN_STATION_FILES
         from callisto_trainer.core.region_inputs import V2_FEATURE_SET, V2_VIEWS
 
         config["model"].update(
@@ -1220,6 +1246,22 @@ def write_training_config(
                 # core/region_inputs.py.
                 "views": list(views or V2_VIEWS),
                 "feature_set": V2_FEATURE_SET,
+                # The file's station and date, as a bounded correction on top of
+                # what the image and region features say: no log-odds -- burst
+                # vs not, or one type vs another -- moves by more than ``cap``.
+                # Labelled burst rates per station mostly reflect which files
+                # were picked for labelling, so a free station input would learn
+                # that instead of the Sun. The station list and date span are
+                # fitted on the training split when training starts. See
+                # models/physics_model.py, StationDateCorrection.
+                "station_date": {
+                    "enabled": True,
+                    "cap": 1.0,
+                    "min_station_files": DEFAULT_MIN_STATION_FILES,
+                    # Share of training samples with these hidden, so the image
+                    # path stands on its own and either can be missing later.
+                    "hide": {"both": 0.25, "station": 0.15, "date": 0.15},
+                },
             }
         )
         config["training"].update(

@@ -5,12 +5,24 @@
 One model over regions. Every candidate region the finder proposes is encoded
 exactly as the exporter encoded the training samples (see
 :mod:`callisto_trainer.core.region_inputs`), and the model returns a probability
-for background, RFI and each burst type. A region is a burst when its **burst
-evidence** -- ``1 - P(No_Burst) - P(RFI)`` -- reaches the checkpoint's
-**calibrated threshold**, tuned after training so that at most a chosen share of
-held-out quiet files is flagged (see :mod:`callisto_trainer.core.file_eval`). A
-file is a burst if any region is. Regions the model assigns to RFI are reported
-as RFI, never as detections.
+for each burst type and for "not a burst". A region is a burst when its **burst
+evidence** -- one minus the probability that it is not a burst -- reaches the
+checkpoint's **calibrated threshold**, tuned after training so that at most a
+chosen share of held-out quiet files is flagged (see
+:mod:`callisto_trainer.core.file_eval`).
+
+**RFI and No_Burst are one outcome here.** The model is trained with RFI as a
+separate rejection class -- measured, that split cut false alarms from 6 to 1
+of 207 held-out quiet files -- but everything reported adds the two together
+as "not a burst". Interference is then *detected separately* among the regions
+that are not bursts: a region is reported as RFI when its measured features
+carry an interference signature (``core/rfi_labels.py``) or the model's own RFI
+output outweighs its background output. So:
+
+* a file with a burst is **Burst**, whatever interference it also holds, and
+  its RFI regions are listed beside the bursts;
+* a file with only RFI is **No_Burst**, with its RFI regions listed;
+* RFI never turns a burst region into a rejection or the reverse.
 
 Before calibration existed the decision was the argmax, and nothing tied it to
 how many quiet files it would flag; a checkpoint without a calibrated threshold
@@ -67,6 +79,7 @@ from callisto_trainer.core.crops import (
 )
 from callisto_trainer.core.fits_reader import read_fits_spectrum_and_axes
 from callisto_trainer.core.logging_utils import get_logger
+from callisto_trainer.core.metadata_features import STATION_DATE_LEN
 from callisto_trainer.core.predict import probability_to_alert_level
 
 # The finder and its settings live in core/region_finder.py; they are re-exported
@@ -114,6 +127,10 @@ class RegionResult:
     # region is a burst of any type. Distinct from type_confidence, which is
     # confidence in the specific class chosen.
     burst_evidence: float | None = None
+    # Model with a station/date correction only: the same evidence with station
+    # and date hidden -- what the image and region features alone say. The gap
+    # between the two is everything station and date contributed.
+    image_only_evidence: float | None = None
     freq_lo_mhz: float | None = None
     freq_hi_mhz: float | None = None
     t_start_s: float | None = None
@@ -127,6 +144,10 @@ class RegionResult:
     burst_count: int | None = None
     # Plain-language reasons the region looks like interference, when any.
     interference_hints: list[str] = field(default_factory=list)
+    # For a region that is not a burst: the interference found in it, when any
+    # (a signature from rfi_labels, or "interference" when only the model's
+    # own RFI output said so). Such a region is reported as RFI.
+    rfi_kind: str | None = None
 
     @property
     def is_rfi(self) -> bool:
@@ -134,6 +155,101 @@ class RegionResult:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class InterferenceSource:
+    """RFI regions sharing the same channels: one source of interference.
+
+    The region finder splits one source into many regions -- measured on real
+    files, the periodic calibration block in a station's lowest channels came
+    out as about 14 segments along time in every file -- so interference is
+    reported per source, with the segments it was found as.
+    """
+
+    kind: str
+    row0: int
+    row1: int
+    col0: int
+    col1: int
+    segments: int
+    freq_lo_mhz: float | None = None
+    freq_hi_mhz: float | None = None
+    t_start_s: float | None = None
+    t_end_s: float | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+# RFI regions whose channel ranges overlap by at least this intersection-over-
+# union are one source. Measured on the channel range alone, so the segments of
+# one carrier or calibration band join while a narrow carrier and a broadband
+# impulse crossing it stay apart.
+SOURCE_ROW_OVERLAP = 0.5
+
+
+def group_interference(
+    regions: Sequence[RegionResult], axes: SpectrumAxes | None = None
+) -> list[InterferenceSource]:
+    """Group RFI regions into sources: regions on (nearly) the same channels."""
+    items = list(regions)
+    parent = list(range(len(items)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            a, b = items[i], items[j]
+            overlap = min(a.row1, b.row1) - max(a.row0, b.row0)
+            union = max(a.row1, b.row1) - min(a.row0, b.row0)
+            if overlap > 0 and union > 0 and overlap / union >= SOURCE_ROW_OVERLAP:
+                parent[find(i)] = find(j)
+
+    groups: dict[int, list[RegionResult]] = {}
+    for index, item in enumerate(items):
+        groups.setdefault(find(index), []).append(item)
+
+    sources: list[InterferenceSource] = []
+    for members in groups.values():
+        kinds: dict[str, int] = {}
+        for member in members:
+            kind = member.rfi_kind or "interference"
+            kinds[kind] = kinds.get(kind, 0) + 1
+        source = InterferenceSource(
+            kind=max(kinds.items(), key=lambda item: item[1])[0],
+            row0=min(m.row0 for m in members),
+            row1=max(m.row1 for m in members),
+            col0=min(m.col0 for m in members),
+            col1=max(m.col1 for m in members),
+            segments=len(members),
+        )
+        if axes is not None:
+            physical = box_to_physical(axes, source.row0, source.row1, source.col0, source.col1)
+            source.freq_lo_mhz = physical["freq_lo_mhz"]
+            source.freq_hi_mhz = physical["freq_hi_mhz"]
+            source.t_start_s = physical["t_start_s"]
+            source.t_end_s = physical["t_end_s"]
+        sources.append(source)
+    sources.sort(key=lambda source: (-source.segments, source.row0))
+    return sources
+
+
+def _file_meta(metadata: dict[str, Any] | None, result: "FileResult") -> dict[str, Any]:
+    """The station and date a station/date-aware model is given for one file.
+
+    Taken from the FITS metadata when there is some, otherwise from what the
+    result already records (a caller that normalized the spectrum itself).
+    """
+    metadata = metadata or {}
+    return {
+        "station": metadata.get("station") or result.station,
+        "date": metadata.get("date") or result.obs_date,
+    }
 
 
 @dataclass
@@ -154,10 +270,12 @@ class FileResult:
     dominant_type: str | None = None
     error: str | None = None
     # Unified model only: how many candidate regions were examined, how many
-    # the model itself rejected, and which of those it called RFI.
+    # the model itself rejected, which of those held interference, and those
+    # grouped into interference sources (what is counted and listed).
     regions_examined: int = 0
     regions_rejected: int = 0
     rfi_regions: list[RegionResult] = field(default_factory=list)
+    rfi_sources: list[InterferenceSource] = field(default_factory=list)
     # Whether the decision threshold was calibrated to a false-alarm budget.
     threshold_calibrated: bool = False
     # Strength of the type-frequency correction the types were decided with.
@@ -169,22 +287,28 @@ class FileResult:
 
     @property
     def region_summary(self) -> str:
+        """The bursts found, then any RFI -- which never changes the verdict."""
         if self.error:
             return "error"
-        if not self.is_burst:
-            return f"RFI x{len(self.rfi_regions)}" if self.rfi_regions else "-"
-        if not self.regions:
-            return "no region located"
-        counts: dict[str, int] = {}
-        for region in self.regions:
-            if region.burst_type:
-                counts[region.burst_type] = counts.get(region.burst_type, 0) + 1
-        return "  ".join(f"{name} x{n}" if n > 1 else name for name, n in sorted(counts.items()))
+        parts: list[str] = []
+        if self.is_burst:
+            counts: dict[str, int] = {}
+            for region in self.regions:
+                if region.burst_type:
+                    counts[region.burst_type] = counts.get(region.burst_type, 0) + 1
+            parts.append(
+                "  ".join(f"{name} x{n}" if n > 1 else name for name, n in sorted(counts.items()))
+                or "no region located"
+            )
+        if self.rfi_sources:
+            parts.append(f"RFI x{len(self.rfi_sources)}")
+        return "  ·  ".join(parts) or "-"
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["regions"] = [region.as_dict() for region in self.regions]
         payload["rfi_regions"] = [region.as_dict() for region in self.rfi_regions]
+        payload["rfi_sources"] = [source.as_dict() for source in self.rfi_sources]
         return payload
 
 
@@ -296,6 +420,7 @@ class CascadePredictor:
         # its calibrated threshold in its config.
         self.unified_model = None
         self.unified_class_names: list[str] = []
+        self.output_class_names: list[str] = []
         self.unified_uses_physics = False
         self.unified_config: dict[str, Any] = {}
         self.encoder = None
@@ -330,6 +455,10 @@ class CascadePredictor:
             )
             self.encoder = RegionEncoder(encoder_config)
             self.unified_uses_physics = self.encoder.spec.feature_set is not None
+            # What is reported: the model's classes with RFI folded into No_Burst.
+            self.output_class_names = [
+                name for name in self.unified_class_names if name != RFI
+            ]
             inference = self.unified_config.get("inference", {}) or {}
             calibrated = inference.get("burst_threshold")
             self.calibrated_threshold = None if calibrated is None else float(calibrated)
@@ -419,7 +548,10 @@ class CascadePredictor:
         """
         if self.is_unified:
             rfi_channels = (metadata or {}).get("rfi_channels_mhz")
-            return self._predict_unified(normalized, axes, result, rfi_channels, quiet)
+            file_meta = _file_meta(metadata, result)
+            return self._predict_unified(
+                normalized, axes, result, rfi_channels, quiet, file_meta=file_meta
+            )
 
         if self.binary_model is not None:
             probability = self._score_binary(normalized, metadata or {})
@@ -447,19 +579,23 @@ class CascadePredictor:
         axes: SpectrumAxes | None,
         rfi_channels: Any = None,
         quiet: np.ndarray | None = None,
+        file_meta: dict[str, Any] | None = None,
     ) -> list[RegionResult]:
         """Every candidate region with the unified model's probabilities.
 
         No decision is applied: each region carries its burst evidence and full
         probability vector, which is what calibration needs. ``decide`` turns
         these into verdicts. The probabilities already carry the type-frequency
-        correction, which leaves burst evidence as it was.
+        correction, which leaves burst evidence as it was, and report RFI and
+        No_Burst together as No_Burst; whether a region holds interference is
+        in ``rfi_kind``, detected separately.
         """
         proposals = self._proposals(normalized)
         boxes = [PixelBox(p.row0, p.row1, p.col0, p.col1) for p in proposals]
         probabilities, encoded = self._unified_probabilities(
-            normalized, axes, boxes, rfi_channels, quiet=quiet
+            normalized, axes, boxes, rfi_channels, quiet=quiet, file_meta=file_meta
         )
+        image_only = self._image_only_probabilities(encoded)
         if len(boxes):
             from callisto_trainer.core.type_priors import adjust_probabilities
 
@@ -468,11 +604,25 @@ class CascadePredictor:
             )
 
         from callisto_trainer.core.region_features import describe_region
+        from callisto_trainer.core.rfi_labels import interference_kind
         from callisto_trainer.core.unified_metrics import burst_evidence
 
         evidence = burst_evidence(probabilities, self.unified_class_names) if len(boxes) else []
+        image_only_evidence = (
+            burst_evidence(image_only, self.unified_class_names)
+            if image_only is not None and len(boxes) else None
+        )
+        names = self.unified_class_names
+        rfi_index = names.index(RFI) if RFI in names else None
+        background_index = names.index(NO_BURST) if NO_BURST in names else None
         regions: list[RegionResult] = []
         for index, proposal in enumerate(proposals):
+            row = probabilities[index]
+            merged = {
+                name: float(row[i]) for i, name in enumerate(names) if name != RFI
+            }
+            if rfi_index is not None and NO_BURST in merged:
+                merged[NO_BURST] += float(row[rfi_index])
             region = RegionResult(
                 row0=proposal.row0,
                 row1=proposal.row1,
@@ -480,18 +630,27 @@ class CascadePredictor:
                 col1=proposal.col1,
                 area=proposal.area,
                 peak=proposal.peak,
-                type_probabilities={
-                    name: float(probabilities[index, i])
-                    for i, name in enumerate(self.unified_class_names)
-                },
+                type_probabilities=merged,
                 burst_evidence=float(evidence[index]),
             )
+            if image_only_evidence is not None:
+                region.image_only_evidence = float(image_only_evidence[index])
             sample = encoded[index]
             if sample.physics is not None:
                 region.drift_mhz_per_s = sample.physics.drift_mhz_per_s
                 region.physics_confidence = sample.physics.confidence
                 region.burst_count = sample.physics.burst_count
             region.interference_hints = describe_region(sample.region)
+            # Interference, detected separately from the burst decision: its
+            # signature, or the model's own RFI output outweighing background.
+            region.rfi_kind = interference_kind(
+                sample.region, (proposal.row0, proposal.row1, proposal.col0, proposal.col1)
+            )
+            if (
+                region.rfi_kind is None and rfi_index is not None and background_index is not None
+                and row[rfi_index] > row[background_index]
+            ):
+                region.rfi_kind = "interference"
             self._attach_physical(region, axes)
             regions.append(region)
         return regions
@@ -503,6 +662,7 @@ class CascadePredictor:
         boxes: Sequence[PixelBox],
         rfi_channels: Any = None,
         quiet: np.ndarray | None = None,
+        file_meta: dict[str, Any] | None = None,
     ) -> np.ndarray:
         """Burst evidence for arbitrary regions of one file (hard-negative mining)."""
         from callisto_trainer.core.unified_metrics import burst_evidence
@@ -510,7 +670,7 @@ class CascadePredictor:
         if not boxes:
             return np.zeros(0)
         probabilities, _ = self._unified_probabilities(
-            normalized, axes, list(boxes), rfi_channels, quiet=quiet
+            normalized, axes, list(boxes), rfi_channels, quiet=quiet, file_meta=file_meta
         )
         return burst_evidence(probabilities, self.unified_class_names)
 
@@ -521,16 +681,40 @@ class CascadePredictor:
         boxes: Sequence[PixelBox],
         rfi_channels: Any = None,
         quiet: np.ndarray | None = None,
+        file_meta: dict[str, Any] | None = None,
     ) -> tuple[np.ndarray, list[Any]]:
-        """``(probabilities [N, K], encoded regions)`` for ``boxes``, batched."""
-        torch = self.torch
+        """``(probabilities [N, K], encoded regions)`` for ``boxes``, batched.
+
+        ``file_meta`` (the file's ``station`` and ``date``) is read only by a
+        model with a station/date correction; without it the correction is off.
+        """
         if not boxes:
             return np.zeros((0, len(self.unified_class_names))), []
         context = self.encoder.context(normalized, axes, rfi_channels)
         encoded = [
-            self.encoder.encode(normalized, box, axes, context, quiet=quiet) for box in boxes
+            self.encoder.encode(normalized, box, axes, context, quiet=quiet, file_meta=file_meta)
+            for box in boxes
         ]
+        return self._score_encoded(encoded), encoded
 
+    def _image_only_probabilities(self, encoded: Sequence[Any]) -> np.ndarray | None:
+        """The same regions scored with station and date hidden, or None.
+
+        None for a model without a station/date correction. For one with it,
+        this is what the image and region features alone say; the encoding is
+        reused, so it costs a forward pass, not a second read of the file.
+        """
+        if self.encoder is None or self.encoder.spec.station_date is None:
+            return None
+        if not encoded:
+            return np.zeros((0, len(self.unified_class_names)))
+        return self._score_encoded(encoded, hide_station_date=True)
+
+    def _score_encoded(
+        self, encoded: Sequence[Any], hide_station_date: bool = False
+    ) -> np.ndarray:
+        """Softmax probabilities ``[N, K]`` for encoded regions, batched."""
+        torch = self.torch
         chunks: list[np.ndarray] = []
         for start in range(0, len(encoded), BATCH_SIZE):
             batch = encoded[start:start + BATCH_SIZE]
@@ -538,34 +722,42 @@ class CascadePredictor:
                 torch.from_numpy(np.stack([item.image for item in batch])).float().to(self.device)
             ]
             if self.unified_uses_physics:
-                inputs.append(
-                    torch.from_numpy(np.stack([item.features for item in batch]))
-                    .float()
-                    .to(self.device)
-                )
+                features = np.stack([item.features for item in batch]).astype(np.float32)
+                if hide_station_date:
+                    # Station index 0 and no date: the correction is exactly off.
+                    features[:, -STATION_DATE_LEN:] = 0.0
+                inputs.append(torch.from_numpy(features).to(self.device))
             with torch.no_grad():
                 logits = self.unified_model(*inputs).reshape(len(batch), -1)
                 chunks.append(torch.softmax(logits.float(), dim=1).cpu().numpy())
-        return np.concatenate(chunks), encoded
+        return np.concatenate(chunks)
 
     def decide(self, region: RegionResult) -> bool:
-        """Label a region from its probabilities. Returns whether it is a burst."""
-        names = self.unified_class_names
+        """Label a region from its probabilities. Returns whether it is a burst.
+
+        A burst region takes its most probable burst type, whatever
+        interference it may also contain. A region that is not a burst is
+        reported as RFI when interference was detected in it (``rfi_kind``) and
+        as No_Burst otherwise.
+        """
+        names = self.output_class_names or self.unified_class_names
         probabilities = region.type_probabilities
         evidence = float(region.burst_evidence or 0.0)
         burst_names = [name for name in names if name not in NON_BURST_LABELS]
-        other_names = [name for name in names if name in NON_BURST_LABELS]
 
         if self.burst_threshold is None:
             is_burst = max(names, key=lambda name: probabilities.get(name, 0.0)) in burst_names
         else:
             is_burst = evidence >= self.burst_threshold
 
-        pool, mass = (burst_names, evidence) if is_burst else (other_names, 1.0 - evidence)
-        best = max(pool, key=lambda name: probabilities.get(name, 0.0))
-        region.burst_type = best
-        # Confidence in the type *given* the burst / not-burst decision.
-        region.type_confidence = float(probabilities.get(best, 0.0) / max(mass, 1e-9))
+        if is_burst:
+            best = max(burst_names, key=lambda name: probabilities.get(name, 0.0))
+            region.burst_type = best
+            # Confidence in the type *given* that it is a burst.
+            region.type_confidence = float(probabilities.get(best, 0.0) / max(evidence, 1e-9))
+        else:
+            region.burst_type = RFI if region.rfi_kind else NO_BURST
+            region.type_confidence = float(max(0.0, min(1.0, 1.0 - evidence)))
         return is_burst
 
     def _predict_unified(
@@ -575,6 +767,7 @@ class CascadePredictor:
         result: FileResult,
         rfi_channels: Any = None,
         quiet: np.ndarray | None = None,
+        file_meta: dict[str, Any] | None = None,
     ) -> FileResult:
         """One model over regions: detection, typing and location at once.
 
@@ -585,7 +778,7 @@ class CascadePredictor:
         """
         from callisto_trainer.core.burst_physics import BOX_DRIFT_TYPES, box_parameters
 
-        regions = self.examine(normalized, axes, rfi_channels, quiet=quiet)
+        regions = self.examine(normalized, axes, rfi_channels, quiet=quiet, file_meta=file_meta)
         bursts: list[RegionResult] = []
         rfi_regions: list[RegionResult] = []
         for region in regions:
@@ -603,6 +796,7 @@ class CascadePredictor:
 
         result.regions = bursts
         result.rfi_regions = rfi_regions
+        result.rfi_sources = group_interference(rfi_regions, axes)
         result.regions_examined = len(regions)
         result.regions_rejected = len(regions) - len(bursts)
 
@@ -777,6 +971,7 @@ CSV_COLUMNS = [
     "region_count",
     "regions",
     "rfi_region_count",
+    "rfi_regions",
     "error",
 ]
 
@@ -794,7 +989,7 @@ def write_csv(results: Sequence[FileResult], output_path: str | Path) -> Path:
         for result in results:
             row = result.as_dict()
             row["region_count"] = len(result.regions)
-            row["rfi_region_count"] = len(result.rfi_regions)
+            row["rfi_region_count"] = len(result.rfi_sources)
             row["regions"] = json.dumps(
                 [
                     {
@@ -806,6 +1001,20 @@ def write_csv(results: Sequence[FileResult], output_path: str | Path) -> Path:
                         "time_s": [region.t_start_s, region.t_end_s],
                     }
                     for region in result.regions
+                ]
+            )
+            # Interference found in the file, one entry per source, listed
+            # separately: it never decides the verdict.
+            row["rfi_regions"] = json.dumps(
+                [
+                    {
+                        "kind": source.kind,
+                        "segments": source.segments,
+                        "pixel_box": [source.row0, source.row1, source.col0, source.col1],
+                        "freq_mhz": [source.freq_lo_mhz, source.freq_hi_mhz],
+                        "time_s": [source.t_start_s, source.t_end_s],
+                    }
+                    for source in result.rfi_sources
                 ]
             )
             writer.writerow(row)

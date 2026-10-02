@@ -92,7 +92,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "device": "auto",
         "mixed_precision": True,
         "amp_dtype": "float16",
-        "channels_last": True,
+        # Off: measured on an RTX 5060 (torch 2.12, CUDA 13), channels_last made
+        # ResNet training 5-8x slower (ResNet18 243 vs 1402 images/s, ResNet50
+        # 58 vs 473) and ConvNeXt no faster. Single-channel spectrogram inputs
+        # do not get the tensor-core layout win it was meant for.
+        "channels_last": False,
         "torch_compile": False,
         "cudnn_benchmark": True,
         "deterministic": False,

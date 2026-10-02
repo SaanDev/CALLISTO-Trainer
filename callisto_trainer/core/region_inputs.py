@@ -15,7 +15,10 @@ What a model takes is described by :class:`RegionInputSpec`:
 * ``feature_set`` -- the vector beside the image: ``None`` for image-only
   models, ``"physics_v1"`` for the original drift/extent measurements, or
   ``"region_v2"`` which adds the interference features of
-  :mod:`callisto_trainer.core.region_features`.
+  :mod:`callisto_trainer.core.region_features`;
+* ``station_date`` -- for a model with a station/date correction, the encoder
+  of the file's station and date, whose vector follows the region features.
+  It is per file, so callers pass the file's metadata (``station``, ``date``).
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ from callisto_trainer.core.crops import (
     quiet_normalized_spectrum,
     region_views,
 )
+from callisto_trainer.core.metadata_features import StationDateEncoder
 from callisto_trainer.core.region_features import (
     FEATURE_SET_PHYSICS_V1,
     FEATURE_SET_REGION_V2,
@@ -58,17 +62,22 @@ class RegionInputSpec:
 
     views: tuple[str, ...] = (VIEW_CROP,)
     feature_set: str | None = None
+    station_date: StationDateEncoder | None = None
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "RegionInputSpec":
         model = config.get("model", {}) or {}
         views = tuple(model.get("views") or (VIEW_CROP,))
         feature_set = None
+        station_date = None
         if bool(model.get("use_physics", False)):
             # Checkpoints from before feature sets existed used the eight
             # physics features, so that is what an unnamed set means.
             feature_set = str(model.get("feature_set") or FEATURE_SET_PHYSICS_V1)
-        return cls(views=views, feature_set=feature_set)
+            section = model.get("station_date") or {}
+            if bool(section.get("enabled", False)):
+                station_date = StationDateEncoder.from_config(section)
+        return cls(views=views, feature_set=feature_set, station_date=station_date)
 
     @property
     def num_views(self) -> int:
@@ -129,7 +138,11 @@ class RegionEncoder:
         axes: SpectrumAxes | None = None,
         context: FileContext | None = None,
         quiet: np.ndarray | None = None,
+        file_meta: dict[str, Any] | None = None,
     ) -> EncodedRegion:
+        """``file_meta`` is the file's ``station`` and ``date`` (a FITS metadata
+        dict or a manifest row); only a model with a station/date correction
+        reads it, and a missing one encodes as "unknown"."""
         image = region_views(normalized, box, self.crop_config, self.spec.views, quiet=quiet)
         if not self.spec.feature_set:
             return EncodedRegion(image=image, features=None)
@@ -148,4 +161,6 @@ class RegionEncoder:
                 context = file_context(normalized, axes)
             region = measure_region(context, box.row0, box.row1, box.col0, box.col1, physics)
         features = feature_vector(self.spec.feature_set, physics, region)
+        if self.spec.station_date is not None:
+            features = np.concatenate([features, self.spec.station_date.vector_for(file_meta)])
         return EncodedRegion(image=image, features=features, physics=physics, region=region)

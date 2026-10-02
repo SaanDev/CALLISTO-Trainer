@@ -15,7 +15,12 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from callisto_trainer.core.augmentations import SpectrumAugmenter
-from callisto_trainer.core.metadata_features import build_station_vocab, row_to_meta_vector
+from callisto_trainer.core.metadata_features import (
+    DEFAULT_MIN_STATION_FILES,
+    StationDateEncoder,
+    build_station_vocab,
+    row_to_meta_vector,
+)
 from callisto_trainer.core.logging_utils import get_logger
 
 
@@ -47,6 +52,7 @@ class CallistoBurstDataset(Dataset):
         return_physics_features: bool = False,
         rows: list[dict[str, str]] | None = None,
         feature_set: str | None = None,
+        station_date: StationDateEncoder | None = None,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.split = split
@@ -67,6 +73,15 @@ class CallistoBurstDataset(Dataset):
 
         if not self.rows:
             raise ValueError(f"No rows found for split={split!r} in {self.manifest_path}")
+
+        # Trainer addition: each file's station + date vector, appended after the
+        # region features for a model with a station/date correction. Built from
+        # the manifest once, not per sample per epoch.
+        self.station_date_vectors: np.ndarray | None = None
+        if station_date is not None and return_physics_features:
+            self.station_date_vectors = np.stack(
+                [station_date.vector_for(row) for row in self.rows]
+            )
 
     def _load_rows(self) -> list[dict[str, str]]:
         rows = _read_manifest_rows(self.manifest_path)
@@ -118,6 +133,10 @@ class CallistoBurstDataset(Dataset):
 
         if self.return_physics_features:
             if stored_features is not None:
+                if self.station_date_vectors is not None:
+                    stored_features = np.concatenate(
+                        [stored_features, self.station_date_vectors[index]]
+                    )
                 return tensor, label, torch.from_numpy(stored_features).float()
             # Trainer addition: measured drift rate and burst extent, read from
             # the manifest columns the exporter wrote.
@@ -193,6 +212,39 @@ def _filter_existing(rows: list[dict[str, str]], split: str) -> list[dict[str, s
     return available
 
 
+def _station_date_encoder(
+    config: dict[str, Any], train_rows: list[dict[str, str]]
+) -> StationDateEncoder | None:
+    """The station/date encoder of ``model.station_date``, fitted if it is new.
+
+    Fitted on the training split only, and written back into the config so it
+    is saved with every checkpoint and reused at inference. A config that
+    already carries a station list (resuming, or evaluating a checkpoint) keeps
+    it: refitting would renumber the stations under trained embeddings.
+    """
+    section = config.get("model", {}).get("station_date") or {}
+    if not bool(section.get("enabled", False)):
+        return None
+    if section.get("station_vocab"):
+        encoder = StationDateEncoder.from_config(section)
+    else:
+        encoder = StationDateEncoder.fit(
+            train_rows,
+            min_station_files=int(section.get("min_station_files", DEFAULT_MIN_STATION_FILES)),
+        )
+        section.update(encoder.to_config())
+        config["model"]["station_date"] = section
+    LOGGER.info(
+        "Station/date correction (cap %.2f): %d station(s) with their own index, "
+        "dates %.2f-%.2f",
+        float(section.get("cap", 1.0)),
+        len(encoder.vocab),
+        encoder.year_min,
+        encoder.year_max,
+    )
+    return encoder
+
+
 def get_dataloaders(config: dict[str, Any]) -> dict[str, DataLoader]:
     """Create train/validation/test DataLoaders from the manifest.
 
@@ -245,6 +297,8 @@ def get_dataloaders(config: dict[str, Any]) -> dict[str, DataLoader]:
             config["model"]["station_vocab"] = metadata_vocab
         LOGGER.info("Metadata conditioning enabled: %d known stations", len(metadata_vocab))
 
+    station_date = _station_date_encoder(config, rows_by_split["train"]) if use_physics else None
+
     train_transform = SpectrumAugmenter(config) if config.get("augmentation", {}).get("enabled", False) else None
 
     def _rows_for(split: str) -> list[dict[str, str]]:
@@ -264,6 +318,7 @@ def get_dataloaders(config: dict[str, Any]) -> dict[str, DataLoader]:
             return_physics_features=use_physics,
             rows=_rows_for(split),
             feature_set=feature_set,
+            station_date=station_date,
         )
 
     datasets = {

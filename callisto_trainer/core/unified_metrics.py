@@ -21,7 +21,26 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from callisto_trainer.core.taxonomy import NON_BURST_LABELS, RFI, family
+from callisto_trainer.core.taxonomy import NO_BURST, NON_BURST_LABELS, RFI, family
+
+
+def merge_rejections(
+    labels: Sequence[int] | np.ndarray, class_names: Sequence[str]
+) -> tuple[np.ndarray, list[str]]:
+    """Report RFI and No_Burst as one "not a burst" class.
+
+    The unified model is trained with RFI as its own rejection class, because
+    that split measurably cut false alarms, but the operator reads one outcome:
+    not a burst. Returns the labels re-indexed onto the class list without RFI,
+    and that list. A class list without both classes is returned unchanged.
+    """
+    names = list(class_names)
+    labels = np.asarray(labels, dtype=int)
+    if RFI not in names or NO_BURST not in names:
+        return labels, names
+    merged = [name for name in names if name != RFI]
+    lookup = np.array([merged.index(NO_BURST if name == RFI else name) for name in names])
+    return (lookup[labels] if labels.size else labels), merged
 
 
 def class_groups(class_names: Sequence[str]) -> tuple[list[int], list[int]]:

@@ -291,8 +291,10 @@ def _run(predictor, monkeypatch, row: dict[str, float]):
     original = predictor._unified_probabilities
     vector = np.array([row.get(name, 0.0) for name in predictor.unified_class_names])
 
-    def fake(normalized, axes, boxes, rfi_channels=None, quiet=None):
-        _, encoded = original(normalized, axes, boxes, rfi_channels, quiet=quiet)
+    def fake(normalized, axes, boxes, rfi_channels=None, quiet=None, file_meta=None):
+        _, encoded = original(
+            normalized, axes, boxes, rfi_channels, quiet=quiet, file_meta=file_meta
+        )
         return np.tile(vector, (len(boxes), 1)), encoded
 
     monkeypatch.setattr(predictor, "_unified_probabilities", fake)
